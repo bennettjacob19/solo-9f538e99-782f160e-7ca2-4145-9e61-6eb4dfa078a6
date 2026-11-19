@@ -27,7 +27,23 @@ CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS ptr_choices (
+    ip         TEXT PRIMARY KEY,
+    name       TEXT NOT NULL,
+    version_id INTEGER NOT NULL
+);
 """
+
+
+class StaleVersionError(Exception):
+    """A PTR choice was submitted against a version that is no longer current.
+
+    The save is rejected and the previously committed answer is kept."""
+
+
+class PtrChoiceError(Exception):
+    """The submitted PTR choice does not match the current committed zone
+    (address not shared, chosen name has no A record for it, ...)."""
 
 
 def utcnow():
@@ -73,6 +89,21 @@ class Store:
                 "INSERT INTO records (version_id, name, rtype, value, ttl)"
                 " VALUES (?, ?, ?, ?, ?)",
                 [(vid, n, t, v, ttl) for n, t, v, ttl in rows],
+            )
+            # Prune PTR choices whose (name, ip) A pair this publish removes.
+            # Running inside the same transaction means a choice can never
+            # outlive its pair: a removed pair's choice is gone immediately,
+            # and re-adding the pair later leaves nothing to resurrect — the
+            # operator must choose again if the address is shared again.
+            conn.execute(
+                "DELETE FROM ptr_choices"
+                " WHERE NOT EXISTS ("
+                " SELECT 1 FROM records r"
+                " WHERE r.version_id = ?"
+                "   AND r.rtype = 'A'"
+                "   AND r.name = ptr_choices.name"
+                "   AND r.value = ptr_choices.ip)",
+                (vid,),
             )
             conn.execute(
                 "INSERT INTO meta (key, value) VALUES ('current_version', ?)"
@@ -125,6 +156,65 @@ class Store:
     def load_current(self):
         vid = self.current_version_id()
         return None if vid is None else self.load_version(vid)
+
+    def load_ptr_choices(self):
+        """Committed PTR ownership map {ip: name} for snapshot rebuild."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT ip, name FROM ptr_choices"
+            ).fetchall()
+            return {r["ip"]: r["name"] for r in rows}
+        finally:
+            conn.close()
+
+    def save_ptr_choice(self, ip, name, expected_version):
+        """Persist a PTR ownership choice against the expected version.
+
+        Rejects (StaleVersionError) when the zone moved on between page render
+        and submit; rejects (PtrChoiceError) when the (name, ip) A pair does
+        not exist in the current committed version. Any failure rolls back and
+        leaves the previously committed answer untouched.
+        """
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT value FROM meta WHERE key = 'current_version'"
+            ).fetchone()
+            current = int(row["value"]) if row else None
+            if current != expected_version:
+                conn.execute("ROLLBACK")
+                raise StaleVersionError(
+                    f"zone version changed (expected v{expected_version},"
+                    f" current is v{current}); reload and choose again"
+                )
+            match = conn.execute(
+                "SELECT 1 FROM records"
+                " WHERE version_id = ? AND rtype = 'A' AND name = ? AND value = ?",
+                (current, name, ip),
+            ).fetchone()
+            if match is None:
+                conn.execute("ROLLBACK")
+                raise PtrChoiceError(
+                    f"{name} has no A record for {ip} in the current version"
+                )
+            conn.execute(
+                "INSERT INTO ptr_choices (ip, name, version_id) VALUES (?, ?, ?)"
+                " ON CONFLICT(ip) DO UPDATE SET name = excluded.name,"
+                " version_id = excluded.version_id",
+                (ip, name, current),
+            )
+            conn.execute("COMMIT")
+            return current
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.close()
 
     def list_versions(self, limit=50):
         conn = self._connect()

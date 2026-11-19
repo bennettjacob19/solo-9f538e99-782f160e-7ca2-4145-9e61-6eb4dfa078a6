@@ -5,11 +5,23 @@ import html
 import sys
 
 import dnslib
-from fastapi import FastAPI, Form
+from fastapi import FastAPI, Form, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from .deps import runtime
-from .zone import Snapshot, ZoneError, flatten_records, fqdn, parse_zone_text
+from .store import PtrChoiceError, StaleVersionError
+from .zone import (
+    REVERSE_NETWORK,
+    REVERSE_ZONE,
+    Snapshot,
+    ZoneError,
+    flatten_records,
+    fqdn,
+    parse_reverse_ip,
+    parse_zone_text,
+    ptr_name,
+    snapshot_from_rows,
+)
 
 app = FastAPI(title="svc.test. zone publisher", docs_url=None, redoc_url=None)
 
@@ -41,6 +53,21 @@ def page(body, title="svc.test. zone publisher", status_code=200):
 
 def current_snapshot():
     return runtime.holder.get()
+
+
+def reload_current_snapshot():
+    """Rebuild the in-memory snapshot from the committed DB state, including
+    the committed PTR choices. Used after a PTR choice write so in-memory
+    state never diverges from what a restart would load."""
+    current = runtime.store.load_current()
+    if current is None:
+        return None
+    ptr_choices = runtime.store.load_ptr_choices()
+    snap = snapshot_from_rows(
+        current["id"], current["created_at"], current["rows"], ptr_choices
+    )
+    runtime.holder.set(snap)
+    return snap
 
 
 def versions_table():
@@ -97,11 +124,17 @@ def index_body(msg="", err=""):
 
 <h2>发起真实查询（UDP → 本机权威 DNS）</h2>
 <form method="get" action="/query">
-  <input type="text" name="name" placeholder="web 或 web.svc.test." required>
+  <input type="text" name="name" placeholder="web 或 web.svc.test.（PTR 时填 10.0.0.10）" required>
   <select name="qtype">
-    <option>A</option><option>CNAME</option><option>ANY</option>
+    <option>A</option><option>CNAME</option><option>PTR</option><option>ANY</option>
   </select>
   <button type="submit">查询</button>
+</form>
+
+<h2>地址反查（10.0.0.0/24 → 指向它的名称 / PTR 归属）</h2>
+<form method="get" action="/reverse">
+  <input type="text" name="ip" placeholder="10.0.0.10" required>
+  <button type="submit">查看指向该地址的名称</button>
 </form>
 
 <h2>发布新版（整版提交，校验/写入任一失败则整版拒绝）</h2>
@@ -145,21 +178,32 @@ def publish(zone_text: str = Form(...), note: str = Form("")):
                     "整版未提交，当前版本继续生效。</div>"
                     "<p><a href='/'>返回</a></p>")
             return page(body, title="写入失败", status_code=500)
-        # 3) commit succeeded: swap the in-memory snapshot for new queries
-        runtime.holder.set(Snapshot(vid, created, parsed))
+        # 3) commit succeeded: swap the in-memory snapshot for new queries.
+        # PTR choices were pruned inside the same transaction; reload the
+        # surviving ones so the snapshot matches the committed DB state.
+        ptr_choices = runtime.store.load_ptr_choices()
+        runtime.holder.set(Snapshot(vid, created, parsed, ptr_choices))
     return RedirectResponse(url=f"/?msg=已发布版本+v{vid}", status_code=303)
 
 
 @app.get("/query", response_class=HTMLResponse)
 def query(name: str = "", qtype: str = "A"):
     qtype = qtype.upper()
-    if qtype not in ("A", "CNAME", "ANY"):
-        return page("<div class='err'>仅支持 A / CNAME / ANY 查询</div><p><a href='/'>返回</a></p>",
+    if qtype not in ("A", "CNAME", "ANY", "PTR"):
+        return page("<div class='err'>仅支持 A / CNAME / PTR / ANY 查询</div><p><a href='/'>返回</a></p>",
                     status_code=400)
-    try:
-        qname = fqdn(name)
-    except ValueError:
-        qname = name.strip().lower().rstrip(".") + "."  # let the server REFUSE it
+    raw = name.strip()
+    if qtype == "PTR":
+        # accept either a plain address (10.0.0.10) or a full reverse name
+        try:
+            qname = ptr_name(parse_reverse_ip(raw))
+        except ValueError:
+            qname = raw.lower().rstrip(".") + "."  # let the server decide
+    else:
+        try:
+            qname = fqdn(name)
+        except ValueError:
+            qname = raw.lower().rstrip(".") + "."  # let the server REFUSE it
     try:
         pkt = dnslib.DNSRecord.question(qname, qtype).send(
             runtime.dns_query_host, runtime.dns_query_port, timeout=3
@@ -178,6 +222,155 @@ def query(name: str = "", qtype: str = "A"):
     body = (f"<h2>查询 {esc(qname)} {qtype}</h2><pre>{esc(chr(10).join(lines))}</pre>"
             "<p><a href='/'>返回</a></p>")
     return page(body, title=f"query {qname}")
+
+
+def reverse_body(ip, err=""):
+    """Render which names have A records at ip and the PTR ownership control."""
+    snap = current_snapshot()
+    if snap is None:
+        return ("<div class='err'>当前没有已发布版本，无法反查。</div>"
+                "<p><a href='/'>返回</a></p>")
+    owners = snap.owners_for_ip(ip)
+    rev = ptr_name(ip)
+    parts = [
+        f"<h2>地址反查 {esc(ip)}</h2>",
+        f"<p class='muted'>反向名称 <code>{esc(rev)}</code>，区域 <code>{esc(REVERSE_ZONE)}</code></p>",
+    ]
+    if err:
+        parts.append(f"<div class='err'>{esc(err)}</div>")
+    if not owners:
+        parts.append(
+            "<p>当前版本中<b>没有任何名称的 A 记录指向该地址</b>，"
+            "PTR 查询将返回 <b>NXDOMAIN</b>。</p>"
+        )
+    else:
+        parts.append(
+            f"<p>当前版本 v{snap.version_id} 中共有 <b>{len(owners)}</b> 个名称的 "
+            f"A 记录指向 {esc(ip)}（PTR 沿用对应 A 记录的 TTL）：</p>"
+        )
+        rows = []
+        chosen = snap.ptr_choices.get(ip)
+        for name, ttl in owners:
+            mark = ""
+            if len(owners) == 1:
+                mark = "（唯一名称，直接反查到它，无需选择）"
+            elif name == chosen:
+                mark = " ✅ 当前 PTR 归属"
+            rows.append(
+                f"<tr><td>{esc(name)}</td><td>{ttl}</td><td>{mark}</td></tr>"
+            )
+        parts.append(
+            "<table><tr><th>名称</th><th>A 记录 TTL</th><th>PTR 归属</th></tr>"
+            + "".join(rows) + "</table>"
+        )
+        if len(owners) > 1:
+            if chosen:
+                parts.append(
+                    "<p>多个名称共用该地址；未选择时 PTR 返回权威空答复（NOERROR），"
+                    f"当前已选择 <code>{esc(chosen)}</code>。可重新选择：</p>"
+                )
+            else:
+                parts.append(
+                    "<p>多个名称共用该地址且<b>尚未选择归属</b>：此时 PTR 查询返回"
+                    " <b>NOERROR 权威空答复</b>。请在下方选定 PTR 归属：</p>"
+                )
+            opts = "".join(
+                f"<option value='{esc(n)}'{(' selected' if n == chosen else '')}>"
+                f"{esc(n)}</option>" for n, _ in owners
+            )
+            parts.append(
+                "<form method='post' action='/ptr-choice'>"
+                f"<input type='hidden' name='ip' value='{esc(ip)}'>"
+                f"<input type='hidden' name='version' value='{snap.version_id}'>"
+                f"<select name='name'>{opts}</select>"
+                "<button type='submit'>保存 PTR 归属</button>"
+                "<p class='muted'>基于当前版本 v"
+                f"{snap.version_id} 提交；若期间区域已发布新版本，保存将被拒绝。</p></form>"
+            )
+        parts.append(
+            f"<p><a href='/query?name={esc(ip)}&qtype=PTR'>对该地址发起真实 UDP PTR 查询</a></p>"
+        )
+    parts.append("<p><a href='/'>返回首页</a></p>")
+    return "".join(parts)
+
+
+@app.get("/reverse", response_class=HTMLResponse)
+def reverse(ip: str = ""):
+    try:
+        addr = parse_reverse_ip(ip)
+    except ValueError as exc:
+        body = (f"<div class='err'>{esc(exc)}</div>"
+                f"<p class='muted'>仅支持 {esc(str(REVERSE_NETWORK))} 内的地址。</p>"
+                "<p><a href='/'>返回</a></p>")
+        return page(body, title="地址无效", status_code=400)
+    return page(reverse_body(addr), title=f"reverse {addr}")
+
+
+@app.post("/ptr-choice", response_class=HTMLResponse)
+def ptr_choice(
+    ip: str = Form(...),
+    name: str = Form(...),
+    version: int = Form(...),
+):
+    try:
+        addr = parse_reverse_ip(ip)
+    except ValueError as exc:
+        return page(f"<div class='err'>{esc(exc)}</div><p><a href='/'>返回</a></p>",
+                    title="地址无效", status_code=400)
+    owner = name.strip().lower()
+    with runtime.publish_lock:
+        snap = current_snapshot()
+        if snap is None:
+            return page("<div class='err'>当前没有已发布版本。</div><p><a href='/'>返回</a></p>",
+                        status_code=409)
+        owners = snap.owners_for_ip(addr)
+        owner_names = {n for n, _ in owners}
+        if len(owners) <= 1 or owner not in owner_names:
+            # only shared addresses need an explicit choice, and the chosen
+            # name must currently have an A record for this address
+            return page(reverse_body(
+                addr,
+                err=f"无法保存：{owner} 不是当前版本中指向 {addr} 的共用地址名称。",
+            ), title="选择无效", status_code=409)
+        try:
+            runtime.store.save_ptr_choice(addr, owner, version)
+        except StaleVersionError as exc:
+            # stale zone version: reject, previously committed answer stays
+            return page(reverse_body(
+                addr,
+                err=f"区域版本已过期，保存被拒绝（{exc}）。请刷新页面后重新选择。",
+            ), title="版本已过期", status_code=409)
+        except PtrChoiceError as exc:
+            return page(reverse_body(addr, err=str(exc)),
+                        title="选择无效", status_code=409)
+        except Exception as exc:  # write failure: keep the old answer
+            print(f"PTR choice write failed: {exc!r}", file=sys.stderr)
+            return page(reverse_body(
+                addr,
+                err=f"写入失败（{type(exc).__name__}: {exc}），原应答保持不变。",
+            ), title="写入失败", status_code=500)
+        reload_current_snapshot()
+    return RedirectResponse(url=f"/reverse?ip={addr}", status_code=303)
+
+
+@app.get("/api/reverse")
+def api_reverse(ip: str):
+    try:
+        addr = parse_reverse_ip(ip)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    snap = current_snapshot()
+    if snap is None:
+        raise HTTPException(status_code=409, detail="no published version yet")
+    owners = snap.owners_for_ip(addr)
+    return {
+        "ip": addr,
+        "reverse_name": ptr_name(addr),
+        "version": snap.version_id,
+        "owners": [{"name": n, "ttl": ttl} for n, ttl in owners],
+        "shared": len(owners) > 1,
+        "chosen": snap.ptr_choices.get(addr),
+    }
 
 
 @app.get("/api/current")

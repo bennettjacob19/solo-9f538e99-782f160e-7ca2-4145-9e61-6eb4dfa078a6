@@ -5,7 +5,7 @@ alias chain against it, so a response never mixes data from two versions.
 Publishing never blocks or interrupts serving: the swap is a reference
 assignment and old snapshots stay alive for in-flight queries."""
 
-from dnslib import A, CNAME, QTYPE, RCODE, RR
+from dnslib import A, CNAME, PTR, QTYPE, RCODE, RR
 from dnslib.server import BaseResolver, DNSServer
 
 from .zone import resolve
@@ -33,7 +33,12 @@ class ZoneResolver(BaseResolver):
         if rcode in ("NOERROR", "NXDOMAIN"):
             reply.header.aa = 1
         for name, rtype, value, ttl in answers:
-            rdata = CNAME(value) if rtype == "CNAME" else A(value)
+            if rtype == "CNAME":
+                rdata = CNAME(value)
+            elif rtype == "PTR":
+                rdata = PTR(value)
+            else:
+                rdata = A(value)
             reply.add_answer(
                 RR(rname=name, rtype=getattr(QTYPE, rtype), rclass=1, ttl=ttl, rdata=rdata)
             )

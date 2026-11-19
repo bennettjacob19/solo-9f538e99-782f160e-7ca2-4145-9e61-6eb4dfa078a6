@@ -27,11 +27,15 @@ def load_current_into_holder():
     if current is None:
         log("no published version in database yet")
         return
+    ptr_choices = runtime.store.load_ptr_choices()
     runtime.holder.set(
-        snapshot_from_rows(current["id"], current["created_at"], current["rows"])
+        snapshot_from_rows(
+            current["id"], current["created_at"], current["rows"], ptr_choices
+        )
     )
     log(f"loaded current version v{current['id']} "
-        f"({len(current['rows'])} records) from database")
+        f"({len(current['rows'])} records, {len(ptr_choices)} PTR choices)"
+        " from database")
 
 
 def refresh_loop():

@@ -6,6 +6,11 @@ import re
 import threading
 
 ZONE = "svc.test."
+# Reverse zone for the operator-facing 10.0.0.0/24 network.
+# Per RFC 1035 the address octets are reversed:
+# 10.0.0.<d>  ->  <d>.0.0.10.in-addr.arpa.
+REVERSE_NETWORK = ipaddress.IPv4Network("10.0.0.0/24")
+REVERSE_ZONE = "0.0.10.in-addr.arpa."
 DEFAULT_TTL = 60
 MAX_TTL = 2_147_483_647
 
@@ -175,11 +180,15 @@ def flatten_records(records):
 class Snapshot:
     """Immutable view of one published version. A query resolves its whole
     alias chain against the single Snapshot instance captured at query start,
-    so the chain and the final A address always come from the same version."""
+    so the chain and the final A address always come from the same version.
 
-    __slots__ = ("version_id", "created_at", "records")
+    ptr_choices is the committed PTR ownership map {ip: owner_name} at the
+    moment this snapshot was built; it is frozen here as well, so a PTR
+    answer's name and its inherited TTL always come from the same state."""
 
-    def __init__(self, version_id, created_at, records):
+    __slots__ = ("version_id", "created_at", "records", "ptr_choices")
+
+    def __init__(self, version_id, created_at, records, ptr_choices=None):
         self.version_id = version_id
         self.created_at = created_at
         # freeze: A lists become tuples, structure is never mutated afterwards
@@ -187,6 +196,7 @@ class Snapshot:
             name: {"A": tuple(rec["A"]), "CNAME": rec["CNAME"], "ttl": rec["ttl"]}
             for name, rec in records.items()
         }
+        self.ptr_choices = dict(ptr_choices or {})
 
     def zone_text(self):
         lines = []
@@ -198,8 +208,20 @@ class Snapshot:
                 lines.append(f"{name} CNAME {rec['CNAME']} {rec['ttl']}")
         return "\n".join(lines)
 
+    def owners_for_ip(self, ip):
+        """All names whose A record points at ip in this version.
 
-def snapshot_from_rows(version_id, created_at, rows):
+        Returns a sorted list of (name, ttl) — the TTL a PTR answer for that
+        name would inherit (it must equal the corresponding A record's TTL).
+        """
+        out = []
+        for name, rec in self.records.items():
+            if ip in rec["A"]:
+                out.append((name, rec["ttl"]))
+        return sorted(out)
+
+
+def snapshot_from_rows(version_id, created_at, rows, ptr_choices=None):
     """Rebuild a Snapshot from stored rows (name, rtype, value, ttl)."""
     records = {}
     for name, rtype, value, ttl in rows:
@@ -208,7 +230,48 @@ def snapshot_from_rows(version_id, created_at, rows):
             rec["A"].append(value)
         else:
             rec["CNAME"] = value
-    return Snapshot(version_id, created_at, records)
+    return Snapshot(version_id, created_at, records, ptr_choices)
+
+
+def parse_reverse_ip(ip_text):
+    """Validate an operator-entered address inside 10.0.0.0/24.
+
+    Returns the canonical dotted-quad string, or raises ValueError.
+    """
+    try:
+        ip = ipaddress.IPv4Address((ip_text or "").strip())
+    except ValueError:
+        raise ValueError(f"invalid IPv4 address '{ip_text}'")
+    if ip not in REVERSE_NETWORK:
+        raise ValueError(f"{ip} is outside the reverse lookup network {REVERSE_NETWORK}")
+    return str(ip)
+
+
+def ptr_name(ip):
+    """10.0.0.<d> -> <d>.0.0.10.in-addr.arpa.
+
+    The 10.0.0.0/24 reverse zone already contains the first three (reversed)
+    octets, so only the host octet becomes an extra label."""
+    return ip.split(".")[3] + "." + REVERSE_ZONE
+
+
+def ip_from_ptr_name(qname):
+    """Parse a qname inside REVERSE_ZONE back to its dotted-quad IP.
+
+    Returns the IP string for '<d>.0.0.10.in-addr.arpa.' style names,
+    None for the reverse-zone apex, and False for a malformed in-zone name.
+    """
+    qname = qname.lower()
+    if qname == REVERSE_ZONE:
+        return None
+    if not qname.endswith("." + REVERSE_ZONE):
+        raise ValueError("not in reverse zone")
+    label = qname[: -len(REVERSE_ZONE) - 1]
+    if "." in label:
+        return False  # deeper labels inside the reverse zone are not ours
+    if not label.isdigit() or not (0 <= int(label) <= 255):
+        return False
+    return f"10.0.0.{int(label)}"
 
 
 class SnapshotHolder:
@@ -235,9 +298,13 @@ def resolve(snapshot, qname, qtype):
     """Resolve qname/qtype against one snapshot.
 
     Returns (rcode, answers) where answers is a list of
-    (name, rtype, value, ttl). qtype is a mnemonic: A, CNAME, ANY, ...
+    (name, rtype, value, ttl). qtype is a mnemonic: A, CNAME, ANY, PTR, ...
+    Forward names are answered from svc.test.; names inside the
+    10.0.0.in-addr.arpa. reverse zone are answered by resolve_reverse().
     """
-    qname = qname.lower()
+    qname = qname.lower().rstrip(".") + "."
+    if qname.endswith("." + REVERSE_ZONE) or qname == REVERSE_ZONE:
+        return resolve_reverse(snapshot, qname, qtype)
     if qname != ZONE and not qname.endswith("." + ZONE):
         return "REFUSED", []
 
@@ -267,3 +334,43 @@ def resolve(snapshot, qname, qtype):
                 answers.extend((node, "A", ip, rec["ttl"]) for ip in rec["A"])
             return "NOERROR", answers
         return "NOERROR", answers  # pragma: no cover
+
+
+def resolve_reverse(snapshot, qname, qtype):
+    """PTR resolution inside the 10.0.0.0/24 reverse zone, one snapshot only.
+
+    - reverse-zone apex: authoritative empty NOERROR (the zone exists)
+    - malformed in-zone name: NXDOMAIN
+    - no A record points at the address anywhere in this version: NXDOMAIN
+    - exactly one owner name: its PTR directly (single-name auto reverse)
+    - several names share the address: answer only when a committed PTR
+      ownership choice exists; otherwise an authoritative empty NOERROR
+      (NODATA) until the operator picks an owner on the web page
+    The PTR TTL is the TTL of the chosen name's A record at this same
+    committed state, so name and TTL always come from one snapshot.
+    """
+    ip = ip_from_ptr_name(qname)
+    if ip is None:
+        return "NOERROR", []  # reverse zone apex: exists, no such data
+    if ip is False:
+        return "NXDOMAIN", []  # malformed name inside the reverse zone
+
+    owners = snapshot.owners_for_ip(ip)
+    if not owners:
+        return "NXDOMAIN", []  # no A record points at this address
+    if qtype not in ("PTR", "ANY"):
+        return "NOERROR", []  # the name exists, just not with this qtype
+
+    if len(owners) == 1:
+        name, ttl = owners[0]  # single owner: reverse directly, no choice needed
+    else:
+        name = snapshot.ptr_choices.get(ip)
+        if name is None:
+            return "NOERROR", []  # shared address, operator has not chosen yet
+        owner_map = dict(owners)
+        if name not in owner_map:
+            # Defensive: a committed choice must reference a live A pair;
+            # publish-time pruning makes this unreachable in normal operation.
+            return "NOERROR", []
+        ttl = owner_map[name]
+    return "NOERROR", [(qname, "PTR", name, ttl)]
